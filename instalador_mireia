@@ -1,0 +1,1520 @@
+#!/usr/bin/env python3
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  MireIA  ·  Asistente de voz local  ·  v0.2-alpha                       │
+# │  Archivo único: instalador + panel de control + asistente               │
+# │  Requiere únicamente Python 3.8+ y tkinter (stdlib)                     │
+# └─────────────────────────────────────────────────────────────────────────┘
+"""
+Uso:
+    python3 mireia.py             →  Abre el panel de control (GUI)
+    python3 mireia.py --run       →  Arranca el asistente de voz directamente
+    python3 mireia.py --debug     →  Modo asistente con salida de error completa
+"""
+
+import argparse
+import json
+import os
+import platform
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tkinter as tk
+import warnings
+from pathlib import Path
+from tkinter import font as tkfont
+from tkinter import messagebox, scrolledtext, ttk
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONSTANTES GLOBALES
+# ══════════════════════════════════════════════════════════════════════════════
+
+VERSION      = "0.2-alpha"
+APP_NAME     = "MireIA"
+CONFIG_PATH  = Path("~/.asistente_voz.json").expanduser()
+PIPER_DIR    = Path("~/Desktop/piper").expanduser()
+PIPER_BIN    = PIPER_DIR / "piper"
+MODELS_DIR   = Path("~/.local/share/piper").expanduser()
+VENV_DIR     = Path("~/.mireia_venv").expanduser()
+VENV_PIP     = VENV_DIR / "bin" / "pip"
+VENV_PY      = VENV_DIR / "bin" / "python"
+LAUNCHER_SH  = Path("~/Desktop/MireIA.sh").expanduser()
+LAUNCHER_DT  = Path("~/.local/share/applications/mireia.desktop").expanduser()
+_TMP_WAV     = Path(tempfile.gettempdir()) / "mireia_tmp.wav"
+
+# Arquitectura → URL de Piper
+_ARCH_MAP = {
+    "x86_64":  "piper_linux_x86_64.tar.gz",
+    "aarch64": "piper_linux_aarch64.tar.gz",
+    "armv7l":  "piper_linux_armv7l.tar.gz",
+}
+_PIPER_BASE = "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/"
+_PIPER_URL  = _PIPER_BASE + _ARCH_MAP.get(platform.machine(), "piper_linux_x86_64.tar.gz")
+
+_VOICE_BASE = ("https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+               "es/es_ES/mls_10246/medium/")
+_VOICE_ONNX = _VOICE_BASE + "es_ES-mls_10246-medium.onnx"
+_VOICE_JSON = _VOICE_BASE + "es_ES-mls_10246-medium.onnx.json"
+_VOICE_CANONICAL_NAME = "mireia_mujer.onnx"
+
+_OLLAMA_MODELS  = ["llama3.2:3b","llama3.2:1b","mistral:7b","mistral:latest",
+                   "phi3:mini","qwen2.5:3b","gemma2:2b","deepseek-r1:7b","llama3:8b"]
+_WHISPER_MODELS = ["tiny","base","small","medium","large"]
+_PIP_PKGS       = ["openai-whisper","SpeechRecognition","pyaudio","ollama"]
+_APT_PKGS       = ["python3-venv","python3-pip","portaudio19-dev","espeak-ng",
+                   "alsa-utils","curl","wget","ffmpeg"]
+_DNF_PKGS       = ["python3-pip","portaudio-devel","espeak-ng","alsa-utils","curl","wget","ffmpeg"]
+_PAC_PKGS       = ["python-pip","portaudio","espeak-ng","alsa-utils","curl","wget","ffmpeg"]
+
+_DISK_NEEDED_MB = 6000   # estimación conservadora (whisper small ~500, ollama ~2000+, voz ~60)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PALETA Y TIPOGRAFÍA
+# ══════════════════════════════════════════════════════════════════════════════
+
+C = {
+    "bg":       "#080b10",
+    "surface":  "#0d1117",
+    "card":     "#111822",
+    "border":   "#1e2d3d",
+    "accent":   "#00d4ff",
+    "accent2":  "#0099bb",
+    "glow":     "#00d4ff22",
+    "success":  "#39d353",
+    "warning":  "#e3b341",
+    "error":    "#f85149",
+    "text":     "#cdd9e5",
+    "muted":    "#4d6279",
+    "dim":      "#768ea6",
+    "hl":       "#162232",
+    "run_bg":   "#0a1628",
+    "run_fg":   "#39d353",
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UTILIDADES COMUNES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_cmd(cmd, shell=False, timeout=None):
+    """(returncode, stdout+stderr)"""
+    try:
+        r = subprocess.run(cmd, shell=shell, capture_output=True,
+                           text=True, timeout=timeout)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        return -1, "Timeout"
+    except Exception as e:
+        return -1, str(e)
+
+
+def is_root():
+    return os.geteuid() == 0
+
+
+def sudo(cmd_list):
+    return (["sudo"] + cmd_list) if not is_root() else cmd_list
+
+
+def detect_pm():
+    for pm in ("apt-get","dnf","pacman","zypper"):
+        if shutil.which(pm):
+            return pm
+    return None
+
+
+def disk_free_mb(path="/"):
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize // (1024 * 1024)
+
+
+def in_audio_group():
+    try:
+        import grp
+        groups = [g.gr_name for g in grp.getgrall() if os.getlogin() in g.gr_mem]
+        return "audio" in groups
+    except Exception:
+        return True   # no bloquear si no podemos comprobarlo
+
+
+def load_config():
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_config(cfg):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
+def voice_model_path():
+    """Devuelve la ruta efectiva del modelo de voz (preferir nombre canónico)."""
+    canonical = MODELS_DIR / _VOICE_CANONICAL_NAME
+    if canonical.exists():
+        return canonical
+    # fallback: nombre original descargado
+    original = MODELS_DIR / "es_ES-mls_10246-medium.onnx"
+    if original.exists():
+        return original
+    return canonical   # aunque no exista
+
+
+def venv_has(import_name):
+    if VENV_PY.exists():
+        rc, _ = run_cmd([str(VENV_PY), "-c", f"import {import_name}"])
+        return rc == 0
+    rc, _ = run_cmd([sys.executable, "-c", f"import {import_name}"])
+    return rc == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODO ASISTENTE (sin GUI)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_assistant(debug=False):
+    """Lanza el asistente de voz en la terminal."""
+    if not CONFIG_PATH.exists():
+        sys.exit(f"✗  No se encuentra {CONFIG_PATH}\n   Ejecuta primero: python3 mireia.py")
+
+    with open(CONFIG_PATH) as f:
+        cfg = json.load(f)
+
+    if not debug:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stderr.fileno())
+        warnings.filterwarnings("ignore")
+
+    # Importaciones pesadas: requieren el venv activo o instaladas en sistema
+    try:
+        import ollama as _ollama
+        import whisper as _whisper
+        import speech_recognition as _sr
+    except ImportError as e:
+        sys.exit(f"✗  Librería no encontrada: {e}\n"
+                 f"   Activa el venv:  source {VENV_DIR}/bin/activate\n"
+                 f"   O reinstala:     python3 mireia.py")
+
+    piper_bin   = cfg.get("piper_bin",   str(PIPER_BIN))
+    voice_model = cfg.get("voice_model", str(voice_model_path()))
+
+    # ── TTS ────────────────────────────────────────────────────────────────────
+    class TTS:
+        def __init__(self):
+            self.q = queue.Queue()
+            threading.Thread(target=self._loop, daemon=True).start()
+
+        def say(self, txt):
+            t = re.sub(r'[*_#`]', '', txt).strip()
+            if t: self.q.put(t)
+
+        def wait(self):
+            self.q.join()
+
+        def _loop(self):
+            while True:
+                t = self.q.get()
+                if os.path.exists(piper_bin) and os.path.exists(voice_model):
+                    try:
+                        t_safe = t.replace('"','').replace("'","")
+                        cmd = (f'echo "{t_safe}" | {piper_bin} --model {voice_model} '
+                               f'--output_raw | aplay -r 22050 -f S16_LE -t raw -D default')
+                        subprocess.run(cmd, shell=True,
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+                    except Exception:
+                        self._fallback(t)
+                else:
+                    self._fallback(t)
+                self.q.task_done()
+
+        def _fallback(self, t):
+            subprocess.run(["espeak-ng","-v","es-es+f2","-s","150", t],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # ── Escucha ────────────────────────────────────────────────────────────────
+    class Listener:
+        def __init__(self):
+            self.r = _sr.Recognizer()
+            self.r.pause_threshold      = 0.8
+            self.r.dynamic_energy_threshold = True
+
+        def listen(self):
+            with _sr.Microphone() as s:
+                self.r.adjust_for_ambient_noise(s, duration=0.5)
+                try:
+                    audio = self.r.listen(s, timeout=10, phrase_time_limit=15)
+                    with open(_TMP_WAV, "wb") as f:
+                        f.write(audio.get_wav_data())
+                    return True
+                except Exception:
+                    return False
+
+    print(f"─── {APP_NAME} {VERSION} ───  Cargando modelos…")
+    model_stt = _whisper.load_model(cfg["whisper"], device="cpu")
+    tts       = TTS()
+    listener  = Listener()
+    history   = []
+    wakes     = [v.strip().lower() for v in cfg["wake_variantes"].split(",")]
+
+    print(f"✨  Activa. Di '{wakes[0]}' para hablar.  Ctrl+C para salir.\n")
+
+    while True:
+        try:
+            print("💤  En espera…", end="\r")
+            if not listener.listen():
+                continue
+
+            res      = model_stt.transcribe(str(_TMP_WAV), language="es", fp16=False)
+            user_txt = res["text"].strip()
+
+            if len(user_txt) < 3 or not any(w in user_txt.lower() for w in wakes):
+                continue
+
+            print(f"\n🗣  Tú: {user_txt}")
+
+            peticion = user_txt
+            for w in wakes:
+                peticion = re.sub(re.escape(w), "", peticion, flags=re.IGNORECASE)
+            peticion = peticion.strip(",?¿!¡ ")
+
+            if not peticion:
+                tts.say("¿Dime?"); tts.wait(); continue
+
+            print("🤖  IA: ", end="", flush=True)
+
+            messages = [{"role":"system","content":cfg["sistema"]}]
+            messages += history
+            messages.append({"role":"user","content":peticion})
+
+            stream = _ollama.chat(
+                model=cfg["modelo"], messages=messages, stream=True,
+                options={"temperature":0.4,"top_p":0.9,
+                         "num_ctx":4096,"num_predict":800})
+
+            full, buf = "", ""
+            for chunk in stream:
+                token = chunk['message']['content']
+                print(token, end="", flush=True)
+                full += token; buf += token
+                if any(c in token for c in ".!?\n"):
+                    tts.say(buf); buf = ""
+            if buf: tts.say(buf)
+            print()
+
+            history.append({"role":"user",      "content":peticion})
+            history.append({"role":"assistant", "content":full})
+            history = history[-6:]
+            tts.wait()
+
+        except KeyboardInterrupt:
+            print(f"\n👋  Apagando {APP_NAME}…")
+            break
+        except Exception as e:
+            if debug: print(f"\n⚠  Error: {e}")
+            time.sleep(1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GUI — VENTANA PRINCIPAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MireIAApp(tk.Tk):
+
+    def __init__(self):
+        super().__init__()
+        self.title(f"{APP_NAME}  ·  Panel de control  ·  {VERSION}")
+        self.geometry("900x680")
+        self.minsize(820, 580)
+        self.configure(bg=C["bg"])
+
+        self._log_q  = queue.Queue()
+        self._prog_q = queue.Queue()
+        self._install_running = False
+        self._check_running   = False
+        self._wizard_open     = False
+
+        self._build_fonts()
+        self._build_layout()
+        self._poll_queues()
+        self.after(300, self._initial_check)
+
+    # ── Fuentes ───────────────────────────────────────────────────────────────
+
+    def _build_fonts(self):
+        self.f_h1    = tkfont.Font(family="Courier 10 Pitch", size=18, weight="bold")
+        self.f_h2    = tkfont.Font(family="Courier 10 Pitch", size=10, weight="bold")
+        self.f_mono  = tkfont.Font(family="Courier 10 Pitch", size=8)
+        self.f_label = tkfont.Font(family="DejaVu Sans",      size=9)
+        self.f_small = tkfont.Font(family="DejaVu Sans",      size=8)
+        self.f_btn   = tkfont.Font(family="DejaVu Sans",      size=9,  weight="bold")
+        self.f_badge = tkfont.Font(family="Courier 10 Pitch", size=8,  weight="bold")
+
+    # ── Layout raíz ───────────────────────────────────────────────────────────
+
+    def _build_layout(self):
+        # ─ Barra superior ─────────────────────────────────────────────────────
+        topbar = tk.Frame(self, bg=C["surface"], height=56)
+        topbar.pack(fill="x")
+        topbar.pack_propagate(False)
+
+        tk.Label(topbar, text="MireIA", font=self.f_h1,
+                 bg=C["surface"], fg=C["accent"]).pack(side="left", padx=20, pady=8)
+        tk.Label(topbar, text=f"v{VERSION}  ·  Asistente de voz local",
+                 font=self.f_small, bg=C["surface"], fg=C["muted"]).pack(side="left", pady=14)
+
+        # badge estado
+        self._badge_var = tk.StringVar(value="● verificando")
+        self._badge_fg  = C["muted"]
+        self._badge_lbl = tk.Label(topbar, textvariable=self._badge_var,
+                                   font=self.f_badge, bg=C["surface"], fg=C["muted"])
+        self._badge_lbl.pack(side="right", padx=20)
+
+        # arquitectura info
+        arch = platform.machine()
+        tk.Label(topbar, text=f"arch:{arch}", font=self.f_small,
+                 bg=C["surface"], fg=C["muted"]).pack(side="right", padx=(0,8))
+
+        # ─ Separador ──────────────────────────────────────────────────────────
+        tk.Frame(self, bg=C["border"], height=1).pack(fill="x")
+
+        # ─ Notebook ───────────────────────────────────────────────────────────
+        style = ttk.Style(self)
+        style.theme_use("default")
+        style.configure("MireIA.TNotebook",
+                        background=C["bg"], borderwidth=0, tabmargins=[0,0,0,0])
+        style.configure("MireIA.TNotebook.Tab",
+                        background=C["surface"], foreground=C["muted"],
+                        font=("Courier 10 Pitch", 8, "bold"),
+                        padding=[18, 9], borderwidth=0, relief="flat")
+        style.map("MireIA.TNotebook.Tab",
+                  background=[("selected", C["card"]),   ("active", C["hl"])],
+                  foreground=[("selected", C["accent"]), ("active", C["text"])])
+        style.configure("M.TProgressbar",
+                        troughcolor=C["border"], background=C["accent"],
+                        thickness=4, borderwidth=0)
+
+        self.nb = ttk.Notebook(self, style="MireIA.TNotebook")
+        self.nb.pack(fill="both", expand=True)
+
+        self._t_install = tk.Frame(self.nb, bg=C["bg"])
+        self._t_config  = tk.Frame(self.nb, bg=C["bg"])
+        self._t_run     = tk.Frame(self.nb, bg=C["bg"])
+        self._t_status  = tk.Frame(self.nb, bg=C["bg"])
+
+        self.nb.add(self._t_install, text="  INSTALAR  ")
+        self.nb.add(self._t_config,  text="  CONFIGURAR  ")
+        self.nb.add(self._t_run,     text="  EJECUTAR  ")
+        self.nb.add(self._t_status,  text="  ESTADO  ")
+
+        self._build_tab_install()
+        self._build_tab_config()
+        self._build_tab_run()
+        self._build_tab_status()
+
+        # ─ Barra inferior ─────────────────────────────────────────────────────
+        btmbar = tk.Frame(self, bg=C["surface"], height=28)
+        btmbar.pack(fill="x", side="bottom")
+        btmbar.pack_propagate(False)
+        self._footer_lbl = tk.Label(btmbar, text="Listo.", font=self.f_small,
+                                    bg=C["surface"], fg=C["muted"])
+        self._footer_lbl.pack(side="left", padx=16)
+        tk.Label(btmbar, text=f"Python {sys.version.split()[0]}  ·  {platform.machine()}",
+                 font=self.f_small, bg=C["surface"], fg=C["muted"]).pack(side="right", padx=16)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  PESTAÑA INSTALAR
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_tab_install(self):
+        f = self._t_install
+
+        # Columna izquierda: pasos
+        left = tk.Frame(f, bg=C["bg"], width=300)
+        left.pack(side="left", fill="y", padx=(20,0), pady=20)
+        left.pack_propagate(False)
+
+        tk.Label(left, text="PASOS", font=self.f_h2,
+                 bg=C["bg"], fg=C["accent"]).pack(anchor="w", pady=(0,10))
+
+        self._step_icons = {}
+        steps = [
+            ("preflight", "Pre-vuelo",           "disco, arquitectura, permisos"),
+            ("sys_deps",  "Dependencias sistema", "apt / dnf / pacman"),
+            ("venv",      "Entorno virtual",       f"~/.mireia_venv"),
+            ("pip",       "Paquetes Python",        "whisper · pyaudio · ollama"),
+            ("piper",     "Piper TTS",              "binario + extracción"),
+            ("voice",     "Modelo de voz",          "español  ~60 MB"),
+            ("ollama",    "Modelo IA",              "ollama pull …"),
+            ("launcher",  "Lanzadores",             ".sh + .desktop"),
+        ]
+        for key, title, desc in steps:
+            row = tk.Frame(left, bg=C["card"], pady=6)
+            row.pack(fill="x", pady=2)
+            icon = tk.Label(row, text="○", font=self.f_badge, width=3,
+                            bg=C["card"], fg=C["muted"])
+            icon.pack(side="left", padx=(8,4))
+            inner = tk.Frame(row, bg=C["card"])
+            inner.pack(side="left", fill="x", expand=True)
+            tk.Label(inner, text=title, font=self.f_label,
+                     bg=C["card"], fg=C["text"], anchor="w").pack(anchor="w")
+            tk.Label(inner, text=desc, font=self.f_small,
+                     bg=C["card"], fg=C["muted"], anchor="w").pack(anchor="w")
+            self._step_icons[key] = icon
+
+        # Barra de progreso
+        tk.Frame(left, bg=C["border"], height=1).pack(fill="x", pady=(12,4))
+        self._progress = ttk.Progressbar(left, orient="horizontal", mode="determinate")
+        self._progress.pack(fill="x", pady=4)
+        self._prog_lbl = tk.Label(left, text="", font=self.f_small,
+                                  bg=C["bg"], fg=C["muted"])
+        self._prog_lbl.pack(anchor="w")
+
+        # Botones
+        btn_frame = tk.Frame(left, bg=C["bg"])
+        btn_frame.pack(fill="x", pady=(10,0))
+        self._btn_install = self._btn(btn_frame, "INSTALAR TODO",
+                                      self._start_install, C["accent"], fg="#000")
+        self._btn_install.pack(fill="x", pady=2)
+        self._btn(btn_frame, "verificar estado",
+                  self._initial_check, C["surface"]).pack(fill="x", pady=2)
+
+        # Columna derecha: log
+        right = tk.Frame(f, bg=C["bg"])
+        right.pack(side="left", fill="both", expand=True, padx=20, pady=20)
+
+        tk.Label(right, text="LOG", font=self.f_h2,
+                 bg=C["bg"], fg=C["accent"]).pack(anchor="w", pady=(0,6))
+
+        log_outer = tk.Frame(right, bg=C["border"], bd=1)
+        log_outer.pack(fill="both", expand=True)
+
+        self._log_widget = tk.Text(
+            log_outer, bg=C["surface"], fg=C["text"],
+            font=self.f_mono, relief="flat", bd=0,
+            state="disabled", wrap="word",
+            insertbackground=C["accent"],
+            selectbackground=C["hl"],
+        )
+        sb = tk.Scrollbar(log_outer, command=self._log_widget.yview,
+                          bg=C["surface"], troughcolor=C["card"],
+                          relief="flat", width=10)
+        self._log_widget.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._log_widget.pack(fill="both", expand=True, padx=1, pady=1)
+
+        # Tags
+        self._log_widget.tag_configure("ok",   foreground=C["success"])
+        self._log_widget.tag_configure("warn", foreground=C["warning"])
+        self._log_widget.tag_configure("err",  foreground=C["error"])
+        self._log_widget.tag_configure("info", foreground=C["dim"])
+        self._log_widget.tag_configure("head", foreground=C["accent"])
+        self._log_widget.tag_configure("sub",  foreground=C["muted"])
+
+        # Limpiar log
+        tk.Button(right, text="limpiar log", command=self._clear_log,
+                  bg=C["bg"], fg=C["muted"], font=self.f_small,
+                  relief="flat", bd=0, cursor="hand2").pack(anchor="e", pady=(4,0))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  PESTAÑA CONFIGURAR
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_tab_config(self):
+        f = self._t_config
+
+        # Canvas + scroll
+        canvas = tk.Canvas(f, bg=C["bg"], highlightthickness=0)
+        vbar   = tk.Scrollbar(f, orient="vertical", command=canvas.yview,
+                              bg=C["border"], troughcolor=C["bg"],
+                              relief="flat", width=10)
+        canvas.configure(yscrollcommand=vbar.set)
+        vbar.pack(side="right", fill="y")
+        canvas.pack(fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=C["bg"])
+        win   = canvas.create_window((0,0), window=inner, anchor="nw")
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(win, width=e.width))
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind_all("<MouseWheel>",
+                        lambda e: canvas.yview_scroll(int(-1*(e.delta/120)),"units"))
+
+        self._cfg = {}   # clave → StringVar
+
+        def section_hdr(text):
+            row = tk.Frame(inner, bg=C["bg"])
+            row.pack(fill="x", padx=24, pady=(18, 4))
+            tk.Label(row, text=text, font=self.f_h2,
+                     bg=C["bg"], fg=C["accent"]).pack(side="left")
+            tk.Frame(row, bg=C["border"], height=1).pack(
+                side="left", fill="x", expand=True, padx=(12,0), pady=5)
+
+        def field(key, label, default="", combo=None, wide=False, tip=""):
+            row = tk.Frame(inner, bg=C["card"])
+            row.pack(fill="x", padx=24, pady=3)
+            tk.Label(row, text=label, font=self.f_label,
+                     bg=C["card"], fg=C["dim"], width=24, anchor="w"
+                     ).pack(side="left", padx=(14,4), pady=10)
+            var = tk.StringVar(value=default)
+            if combo:
+                w = ttk.Combobox(row, textvariable=var, values=combo,
+                                 font=self.f_label, state="normal",
+                                 width=35 if wide else 24)
+                w.pack(side="left", padx=(0,12), pady=8)
+            else:
+                w = tk.Entry(row, textvariable=var, font=self.f_label,
+                             bg=C["bg"], fg=C["text"], relief="flat",
+                             insertbackground=C["accent"],
+                             width=55 if wide else 32)
+                w.pack(side="left", padx=(0,12), pady=8, fill="x" if wide else "none",
+                       expand=wide)
+            if tip:
+                tk.Label(row, text=tip, font=self.f_small,
+                         bg=C["card"], fg=C["muted"]).pack(side="left", padx=(0,10))
+            self._cfg[key] = var
+            return var
+
+        cfg = load_config()
+
+        section_hdr("MOTOR DE IA")
+        field("modelo",  "Modelo Ollama",  cfg.get("modelo","llama3.2:3b"),
+              combo=_OLLAMA_MODELS, tip="se descargará automáticamente si no existe")
+        field("whisper", "Modelo Whisper", cfg.get("whisper","small"),
+              combo=_WHISPER_MODELS, tip="tiny=rápido, medium=preciso")
+
+        section_hdr("ACTIVACIÓN POR VOZ")
+        field("wake_variantes", "Palabras clave",
+              cfg.get("wake_variantes","mireia, mire, ei mireia"), wide=True,
+              tip="separadas por coma")
+
+        section_hdr("PERSONALIDAD")
+        sys_row = tk.Frame(inner, bg=C["card"])
+        sys_row.pack(fill="x", padx=24, pady=3)
+        tk.Label(sys_row, text="Prompt de sistema", font=self.f_label,
+                 bg=C["card"], fg=C["dim"], width=24, anchor="nw"
+                 ).pack(side="left", padx=(14,4), pady=10)
+        self._sys_text = tk.Text(
+            sys_row, font=self.f_label, bg=C["bg"], fg=C["text"],
+            relief="flat", bd=0, wrap="word", height=6,
+            insertbackground=C["accent"],
+            selectbackground=C["hl"])
+        default_sys = cfg.get("sistema",
+            "Eres Mireia, una asistente de voz en español. Responde de forma concisa "
+            "y natural, como si estuvieras hablando. Evita listas y formatos; habla en "
+            "prosa. Sé amable, directa y útil. Máximo 3 frases salvo que pidan más detalle.")
+        self._sys_text.insert("1.0", default_sys)
+        self._sys_text.pack(side="left", fill="x", expand=True, padx=(0,12), pady=8)
+
+        section_hdr("RUTAS")
+        field("piper_bin",   "Binario Piper",     cfg.get("piper_bin",   str(PIPER_BIN)),   wide=True)
+        field("voice_model", "Modelo voz (.onnx)",cfg.get("voice_model", str(voice_model_path())), wide=True)
+
+        section_hdr("AVANZADO")
+        field("temperatura", "Temperatura IA",    cfg.get("temperatura","0.4"),
+              tip="0.1 conservador — 1.0 creativo")
+        field("num_predict", "Max tokens resp.",  cfg.get("num_predict","800"))
+
+        # Botones
+        brow = tk.Frame(inner, bg=C["bg"])
+        brow.pack(fill="x", padx=24, pady=(14,28))
+        self._btn(brow, "GUARDAR", self._save_config, C["accent"], fg="#000"
+                  ).pack(side="left", padx=(0,8))
+        self._btn(brow, "recargar desde disco",
+                  self._reload_config, C["surface"]).pack(side="left")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  PESTAÑA EJECUTAR
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_tab_run(self):
+        f = self._t_run
+        f.configure(bg=C["run_bg"])
+
+        # Panel central
+        center = tk.Frame(f, bg=C["run_bg"])
+        center.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Indicador animado
+        self._run_anim_chars = ["◜","◝","◞","◟"]
+        self._run_anim_idx   = 0
+        self._run_active     = False
+
+        self._run_anim_lbl = tk.Label(center, text="◌", font=tkfont.Font(
+            family="Courier 10 Pitch", size=48, weight="bold"),
+            bg=C["run_bg"], fg=C["muted"])
+        self._run_anim_lbl.pack(pady=(0,12))
+
+        self._run_status_lbl = tk.Label(center,
+            text="Asistente en reposo", font=self.f_h2,
+            bg=C["run_bg"], fg=C["muted"])
+        self._run_status_lbl.pack()
+
+        self._run_last_lbl = tk.Label(center, text="",
+            font=self.f_small, bg=C["run_bg"], fg=C["dim"],
+            wraplength=420, justify="center")
+        self._run_last_lbl.pack(pady=(6,0))
+
+        tk.Frame(center, bg=C["border"], height=1, width=360).pack(pady=20)
+
+        # Info config actual
+        self._run_cfg_lbl = tk.Label(center, text="",
+            font=self.f_small, bg=C["run_bg"], fg=C["muted"])
+        self._run_cfg_lbl.pack()
+
+        # Botones
+        btn_row = tk.Frame(center, bg=C["run_bg"])
+        btn_row.pack(pady=24)
+        self._btn_start = self._btn(btn_row, "INICIAR ASISTENTE",
+                                    self._start_assistant_process, C["success"], fg="#000",
+                                    size=(200, 42))
+        self._btn_start.pack(side="left", padx=8)
+        self._btn_stop  = self._btn(btn_row, "DETENER",
+                                    self._stop_assistant, C["error"], fg="#fff",
+                                    size=(120, 42))
+        self._btn_stop.pack(side="left", padx=8)
+        self._btn_stop.configure(state="disabled")
+
+        # Log compacto
+        log_frame = tk.Frame(f, bg=C["run_bg"])
+        log_frame.pack(fill="x", padx=30, pady=(0,20), side="bottom")
+        self._run_log = tk.Text(log_frame, bg=C["surface"], fg=C["dim"],
+                                font=self.f_mono, relief="flat", bd=0,
+                                height=6, state="disabled", wrap="word")
+        self._run_log.pack(fill="x")
+        self._run_log.tag_configure("ia",  foreground=C["accent"])
+        self._run_log.tag_configure("usr", foreground=C["text"])
+        self._run_log.tag_configure("sys", foreground=C["muted"])
+
+        self._assistant_proc = None
+        self._update_run_cfg_label()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  PESTAÑA ESTADO
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_tab_status(self):
+        f = self._t_status
+
+        tk.Label(f, text="DIAGNÓSTICO DEL SISTEMA", font=self.f_h2,
+                 bg=C["bg"], fg=C["accent"]).pack(anchor="w", padx=24, pady=(20,8))
+        tk.Frame(f, bg=C["border"], height=1).pack(fill="x", padx=24, pady=(0,12))
+
+        self._status_rows = {}
+        checks = [
+            ("python",    "Python 3.8+"),
+            ("venv",      f"Entorno virtual  ({VENV_DIR.name})"),
+            ("whisper",   "openai-whisper"),
+            ("sr",        "SpeechRecognition"),
+            ("pyaudio",   "PyAudio"),
+            ("ollama_lib","Librería ollama"),
+            ("piper_bin", "Binario Piper TTS"),
+            ("voice_mdl", "Modelo de voz"),
+            ("ollama_srv","Servicio Ollama"),
+            ("config",    f"Configuración  ({CONFIG_PATH.name})"),
+            ("espeak",    "espeak-ng  (fallback TTS)"),
+            ("aplay",     "aplay  (alsa-utils)"),
+            ("ffmpeg",    "ffmpeg"),
+            ("audio_grp", "Grupo audio (permisos mic)"),
+            ("disk",      "Espacio en disco"),
+        ]
+
+        grid = tk.Frame(f, bg=C["bg"])
+        grid.pack(fill="both", expand=True, padx=24)
+
+        for key, label in checks:
+            row = tk.Frame(grid, bg=C["card"], pady=6)
+            row.pack(fill="x", pady=2)
+            icon = tk.Label(row, text="…", font=self.f_badge, width=4,
+                            bg=C["card"], fg=C["muted"])
+            icon.pack(side="left", padx=(12,6))
+            tk.Label(row, text=label, font=self.f_label,
+                     bg=C["card"], fg=C["text"], anchor="w").pack(side="left")
+            note = tk.Label(row, text="", font=self.f_small,
+                            bg=C["card"], fg=C["muted"])
+            note.pack(side="right", padx=14)
+            self._status_rows[key] = (icon, note)
+
+        brow = tk.Frame(f, bg=C["bg"])
+        brow.pack(fill="x", padx=24, pady=(8,20))
+        self._btn(brow, "ACTUALIZAR", self._run_status_check,
+                  C["surface"]).pack(side="left")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  WIDGETS HELPERS
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _btn(self, parent, text, cmd, bg, fg=None, size=None):
+        fg = fg or C["text"]
+        b = tk.Button(parent, text=text, command=cmd,
+                      bg=bg, fg=fg, font=self.f_btn,
+                      relief="flat", bd=0, padx=14, pady=7,
+                      cursor="hand2",
+                      activebackground=C["hl"], activeforeground=C["text"])
+        if size:
+            b.configure(width=0)  # ignorar width tkinter, usar padx
+        orig = bg
+        b.bind("<Enter>", lambda e: b.configure(bg=C["hl"]))
+        b.bind("<Leave>", lambda e: b.configure(bg=orig))
+        return b
+
+    def _set_step(self, key, state):
+        MAP = {
+            "pending": ("○", C["muted"]),
+            "running": ("◌", C["warning"]),
+            "ok":      ("✓", C["success"]),
+            "warn":    ("⚠", C["warning"]),
+            "skip":    ("–", C["muted"]),
+            "err":     ("✗", C["error"]),
+        }
+        icon, color = MAP.get(state, ("?", C["muted"]))
+        lbl = self._step_icons.get(key)
+        if lbl:
+            self.after(0, lambda: lbl.configure(text=icon, fg=color))
+
+    def _update_badge(self, text, fg):
+        self.after(0, lambda: self._badge_lbl.configure(text=text, fg=fg))
+
+    def _update_status_row(self, key, state, note=""):
+        MAP = {"ok":("✓",C["success"]),"warn":("⚠",C["warning"]),
+               "err":("✗",C["error"]),"skip":("–",C["muted"])}
+        icon, color = MAP.get(state, ("…",C["muted"]))
+        def _do():
+            row = self._status_rows.get(key)
+            if row:
+                row[0].configure(text=icon, fg=color)
+                if note: row[1].configure(text=note)
+        self.after(0, _do)
+
+    def _footer(self, msg):
+        self.after(0, lambda: self._footer_lbl.configure(text=msg))
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+
+    def log(self, msg, tag="info"):
+        self._log_q.put((msg, tag))
+
+    def set_progress(self, val, label=""):
+        self._prog_q.put((val, label))
+
+    def _clear_log(self):
+        self._log_widget.configure(state="normal")
+        self._log_widget.delete("1.0","end")
+        self._log_widget.configure(state="disabled")
+
+    def _poll_queues(self):
+        try:
+            while True:
+                msg, tag = self._log_q.get_nowait()
+                self._log_widget.configure(state="normal")
+                self._log_widget.insert("end", msg+"\n", tag)
+                self._log_widget.see("end")
+                self._log_widget.configure(state="disabled")
+        except queue.Empty:
+            pass
+        try:
+            while True:
+                val, lbl = self._prog_q.get_nowait()
+                self._progress["value"] = val
+                self._prog_lbl.configure(text=lbl)
+        except queue.Empty:
+            pass
+        self.after(80, self._poll_queues)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  COMPROBACIÓN INICIAL
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _initial_check(self):
+        if self._check_running:
+            return
+        self._update_badge("verificando...", C["muted"])
+        threading.Thread(target=self._check_thread, daemon=True).start()
+
+    def _check_thread(self):
+        self._check_running = True
+        issues = []
+        self.log("─────────────────────────────────────────────", "sub")
+        self.log("  COMPROBACIÓN DEL SISTEMA", "head")
+        self.log("─────────────────────────────────────────────", "sub")
+
+        v = sys.version_info
+        if v >= (3,8):
+            self.log(f"  python {v.major}.{v.minor}.{v.micro}  OK", "ok")
+            self._update_status_row("python","ok",f"{v.major}.{v.minor}.{v.micro}")
+        else:
+            self.log(f"  python {v.major}.{v.minor} demasiado antiguo","err")
+            self._update_status_row("python","err","< 3.8")
+            issues.append("Python")
+
+        if VENV_PY.exists():
+            self.log(f"  venv  OK", "ok")
+            self._update_status_row("venv","ok"); self._set_step("venv","ok")
+        else:
+            self.log(f"  venv  no encontrado","warn")
+            self._update_status_row("venv","warn","no creado"); self._set_step("venv","pending")
+            issues.append("venv")
+
+        for pkg, key, imp in [
+            ("whisper","whisper","whisper"),
+            ("SpeechRecognition","sr","speech_recognition"),
+            ("pyaudio","pyaudio","pyaudio"),
+            ("ollama","ollama_lib","ollama"),
+        ]:
+            ok = venv_has(imp)
+            self.log(f"  {pkg}  {'OK' if ok else 'falta'}", "ok" if ok else "warn")
+            self._update_status_row(key, "ok" if ok else "warn",
+                                    "" if ok else "no instalado")
+            if not ok: issues.append(pkg)
+        pip_ok = not any(p in issues for p in ["whisper","SpeechRecognition","pyaudio","ollama"])
+        self._set_step("pip","ok" if pip_ok else "pending")
+
+        if PIPER_BIN.exists():
+            self.log(f"  piper  OK","ok")
+            self._update_status_row("piper_bin","ok",str(PIPER_BIN)); self._set_step("piper","ok")
+        else:
+            self.log(f"  piper  no encontrado","warn")
+            self._update_status_row("piper_bin","warn","no instalado"); self._set_step("piper","pending")
+            issues.append("piper")
+
+        vm = voice_model_path()
+        if vm.exists():
+            self.log(f"  modelo voz  OK","ok")
+            self._update_status_row("voice_mdl","ok",vm.name); self._set_step("voice","ok")
+        else:
+            self.log(f"  modelo voz  no encontrado","warn")
+            self._update_status_row("voice_mdl","warn","no descargado"); self._set_step("voice","pending")
+            issues.append("voz")
+
+        if shutil.which("ollama"):
+            rc, out = run_cmd(["ollama","list"], timeout=5)
+            if rc == 0:
+                self.log(f"  ollama  OK","ok")
+                self._update_status_row("ollama_srv","ok"); self._set_step("ollama","ok")
+                cfg = load_config()
+                modelo = cfg.get("modelo","")
+                if modelo and not any(modelo.split(":")[0] in l for l in out.splitlines()):
+                    self.log(f"  ⚠  modelo '{modelo}' no descargado","warn")
+                    self._set_step("ollama","warn")
+            else:
+                self.log(f"  ollama  servicio inactivo","warn")
+                self._update_status_row("ollama_srv","warn","servicio offline")
+                self._set_step("ollama","warn")
+        else:
+            self.log(f"  ollama  no instalado","warn")
+            self._update_status_row("ollama_srv","warn","no instalado"); self._set_step("ollama","warn")
+            issues.append("ollama")
+
+        if CONFIG_PATH.exists():
+            self.log(f"  config  OK","ok")
+            self._update_status_row("config","ok",str(CONFIG_PATH))
+        else:
+            self.log(f"  config  no existe","warn")
+            self._update_status_row("config","warn","no creado")
+            issues.append("config")
+            if not self._wizard_open:
+                self.after(500, self._open_config_wizard)
+
+        for tool, key in [("espeak-ng","espeak"),("aplay","aplay"),("ffmpeg","ffmpeg")]:
+            ex = bool(shutil.which(tool))
+            self._update_status_row(key, "ok" if ex else "warn",
+                                    "" if ex else "no instalado")
+
+        audio_ok = in_audio_group()
+        self._update_status_row("audio_grp", "ok" if audio_ok else "warn",
+                                "OK" if audio_ok else "puede necesitar: sudo usermod -aG audio $USER")
+
+        free = disk_free_mb()
+        disk_ok = free >= 2000
+        self._update_status_row("disk", "ok" if disk_ok else "warn",
+                                f"{free} MB libres")
+
+        self._set_step("sys_deps","pending" if issues else "ok")
+        self._set_step("preflight","ok" if disk_ok else "warn")
+
+        if issues:
+            self.log(f"\n  ⚠  Pendiente: {', '.join(issues)}", "warn")
+            self._update_badge("pendiente", C["warning"])
+        else:
+            self.log("\n  ✓  Sistema listo.", "ok")
+            self._update_badge("listo", C["success"])
+
+        self._update_run_cfg_label()
+        self._check_running = False
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  INSTALACIÓN
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _start_install(self):
+        if self._install_running:
+            return
+        self._install_running = True
+        self._btn_install.configure(state="disabled")
+        threading.Thread(target=self._install_thread, daemon=True).start()
+
+    def _install_thread(self):
+        N = 8
+        step = 0
+        def adv(key, title):
+            nonlocal step
+            step += 1
+            self._set_step(key, "running")
+            self.log(f"\n── [{step}/{N}] {title} ──", "head")
+            self.set_progress(int(step/N*100), f"[{step}/{N}] {title}")
+
+        # 0. Pre-vuelo
+        adv("preflight","Pre-vuelo")
+        warnings_list = []
+        arch = platform.machine()
+        self.log(f"  Arquitectura: {arch}", "info")
+        if arch not in _ARCH_MAP:
+            self.log(f"  ⚠  Arquitectura no soportada en Piper precompilado","warn")
+            warnings_list.append("arch")
+        free = disk_free_mb()
+        self.log(f"  Disco libre: {free} MB", "info")
+        if free < _DISK_NEEDED_MB:
+            self.log(f"  ⚠  Se recomiendan {_DISK_NEEDED_MB} MB, hay {free} MB","warn")
+            warnings_list.append("disco")
+        if not in_audio_group():
+            self.log(f"  ⚠  El usuario no está en el grupo 'audio'","warn")
+            self.log(f"     Solución: sudo usermod -aG audio $USER  (requiere re-login)","warn")
+        self._set_step("preflight","warn" if warnings_list else "ok")
+
+        # 1. Dependencias del sistema
+        adv("sys_deps","Dependencias del sistema")
+        ok = self._install_sys_deps()
+        self._set_step("sys_deps","ok" if ok else "warn")
+
+        # 2. Entorno virtual
+        adv("venv","Entorno virtual Python")
+        ok = self._create_venv()
+        self._set_step("venv","ok" if ok else "err")
+        if not ok:
+            self.log("Abortando instalación.","err")
+            self._finalize(False); return
+
+        # 3. pip
+        adv("pip","Paquetes Python")
+        ok = self._install_pip()
+        self._set_step("pip","ok" if ok else "warn")
+
+        # 4. Piper
+        adv("piper","Piper TTS")
+        ok = self._install_piper()
+        self._set_step("piper","ok" if ok else "warn")
+
+        # 5. Modelo de voz
+        adv("voice","Modelo de voz")
+        ok = self._install_voice()
+        self._set_step("voice","ok" if ok else "warn")
+
+        # 6. Modelo Ollama
+        adv("ollama","Modelo de IA (ollama pull)")
+        self._pull_ollama_model()
+        self._set_step("ollama","ok")
+
+        # 7. Lanzadores
+        adv("launcher","Creando lanzadores")
+        self._create_launchers()
+        self._set_step("launcher","ok")
+
+        self.set_progress(100,"Completado")
+        self._finalize(True)
+
+    def _finalize(self, ok):
+        def _do():
+            self._install_running = False
+            self._btn_install.configure(state="normal")
+            if ok:
+                self.log("\nInstalación completada.","ok")
+                self._update_badge("listo", C["success"])
+                if not CONFIG_PATH.exists():
+                    self.after(400, self._open_config_wizard)
+                else:
+                    self.after(400, lambda: self.nb.select(1))
+            else:
+                self.log("\n✗  Instalación incompleta.","err")
+                self._update_badge("error", C["error"])
+        self.after(0, _do)
+
+    # ── Pasos individuales ────────────────────────────────────────────────────
+
+    def _install_sys_deps(self):
+        pm = detect_pm()
+        if not pm:
+            self.log("  ⚠  Gestor de paquetes no detectado. Omitiendo.","warn")
+            return False
+        self.log(f"  Gestor: {pm}","info")
+        if pm in ("apt-get","apt"):
+            cmds = [
+                sudo([pm,"update","-qq"]),
+                sudo([pm,"install","-y"]+_APT_PKGS),
+            ]
+        elif pm == "dnf":
+            cmds = [sudo([pm,"install","-y"]+_DNF_PKGS)]
+        elif pm == "pacman":
+            cmds = [sudo([pm,"-Sy","--noconfirm"]+_PAC_PKGS)]
+        else:
+            cmds = []
+        for c in cmds:
+            self.log(f"  $ {' '.join(c)}","sub")
+            rc, out = run_cmd(c)
+            for l in out.splitlines()[-5:]:
+                if l.strip(): self.log(f"    {l}","info")
+            if rc not in (0, 100):   # 100 = apt nada que hacer
+                self.log(f"  ⚠  código {rc} (¿requiere contraseña sudo?)","warn")
+        self.log("  ✓  Dependencias procesadas.","ok")
+        return True
+
+    def _create_venv(self):
+        if VENV_PY.exists():
+            self.log(f"  Venv ya existe. Omitiendo.","ok")
+            return True
+        self.log(f"  Creando {VENV_DIR} …","info")
+        rc, out = run_cmd([sys.executable,"-m","venv",str(VENV_DIR)])
+        if rc != 0:
+            self.log(f"  ✗  {out}","err"); return False
+        self.log("  ✓  Venv creado.","ok")
+        return True
+
+    def _install_pip(self):
+        if not VENV_PIP.exists():
+            self.log("  ✗  pip del venv no encontrado.","err"); return False
+        all_ok = True
+        for pkg in _PIP_PKGS:
+            self.log(f"  pip install {pkg} …","info")
+            rc, out = run_cmd([str(VENV_PIP),"install","--upgrade",pkg],timeout=300)
+            for l in out.splitlines()[-3:]:
+                if l.strip(): self.log(f"    {l}","sub")
+            if rc == 0:
+                self.log(f"  ✓  {pkg}","ok")
+            else:
+                self.log(f"  ✗  {pkg}","err"); all_ok = False
+        return all_ok
+
+    def _install_piper(self):
+        if PIPER_BIN.exists():
+            self.log("  Piper ya instalado. Omitiendo.","ok"); return True
+        arch   = platform.machine()
+        tgz_fn = _ARCH_MAP.get(arch,"piper_linux_x86_64.tar.gz")
+        url    = _PIPER_BASE + tgz_fn
+        tmp    = Path(tempfile.gettempdir()) / "piper.tar.gz"
+        self.log(f"  Descargando {tgz_fn} …","info")
+        rc, out = run_cmd(["wget","-q","-O",str(tmp),url], timeout=180)
+        if rc != 0:
+            rc, out = run_cmd(["curl","-L","-o",str(tmp),url], timeout=180)
+        if rc != 0:
+            self.log(f"  ✗  Descarga fallida. URL manual:\n     {url}","err")
+            return False
+        PIPER_DIR.mkdir(parents=True, exist_ok=True)
+        rc, out = run_cmd(["tar","-xzf",str(tmp),"-C",str(PIPER_DIR),"--strip-components=1"])
+        if rc != 0:
+            self.log(f"  ✗  Error extrayendo: {out}","err"); return False
+        if PIPER_BIN.exists():
+            os.chmod(PIPER_BIN,0o755)
+            self.log(f"  ✓  Piper en {PIPER_BIN}","ok"); return True
+        self.log("  ✗  Binario no encontrado tras extracción.","err"); return False
+
+    def _install_voice(self):
+        canonical = MODELS_DIR / _VOICE_CANONICAL_NAME
+        if canonical.exists():
+            self.log(f"  Modelo de voz ya existe ({canonical.name}). Omitiendo.","ok")
+            return True
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        self.log("  Descargando modelo español (~60 MB) …","info")
+        tmp_onnx = MODELS_DIR / "es_ES-mls_10246-medium.onnx"
+        tmp_json = MODELS_DIR / "es_ES-mls_10246-medium.onnx.json"
+        ok = True
+        for url, dest in [(_VOICE_ONNX, tmp_onnx), (_VOICE_JSON, tmp_json)]:
+            self.log(f"  → {dest.name}","info")
+            rc, out = run_cmd(["wget","-q","-O",str(dest),url], timeout=300)
+            if rc != 0:
+                rc, out = run_cmd(["curl","-L","-o",str(dest),url], timeout=300)
+            if rc != 0:
+                self.log(f"  ✗  Error descargando {dest.name}","err"); ok = False
+        if ok and tmp_onnx.exists():
+            # Renombrar al nombre canónico esperado por el asistente
+            tmp_onnx.rename(canonical)
+            # Renombrar también el json
+            new_json = MODELS_DIR / (_VOICE_CANONICAL_NAME + ".json")
+            if tmp_json.exists():
+                tmp_json.rename(new_json)
+            self.log(f"  ✓  Modelo guardado como '{_VOICE_CANONICAL_NAME}'","ok")
+            # Actualizar config si existe
+            cfg = load_config()
+            if cfg:
+                cfg["voice_model"] = str(canonical)
+                save_config(cfg)
+                self.log(f"  ✓  Ruta voice_model actualizada en config","ok")
+            # Actualizar campo en GUI
+            if "voice_model" in self._cfg:
+                self.after(0, lambda: self._cfg["voice_model"].set(str(canonical)))
+        return ok
+
+    def _pull_ollama_model(self):
+        if not shutil.which("ollama"):
+            self.log("  ✗  Ollama no instalado. Instala desde https://ollama.com","err")
+            self.log("     curl -fsSL https://ollama.com/install.sh | sh","info")
+            return
+        cfg   = load_config()
+        model = cfg.get("modelo") or self._cfg.get("modelo","").get() if hasattr(self._cfg.get("modelo",""),"get") else "llama3.2:3b"
+        if not model:
+            model = "llama3.2:3b"
+        # Comprobar si ya existe
+        rc, out = run_cmd(["ollama","list"], timeout=10)
+        base = model.split(":")[0]
+        if rc == 0 and base in out:
+            self.log(f"  Modelo '{model}' ya descargado. Omitiendo.","ok")
+            return
+        self.log(f"  ollama pull {model} (puede tardar bastante) …","warn")
+        rc, out = run_cmd(["ollama","pull",model], timeout=600)
+        if rc == 0:
+            self.log(f"  ✓  Modelo '{model}' disponible.","ok")
+        else:
+            self.log(f"  ✗  Error descargando modelo. Inténtalo manualmente:","err")
+            self.log(f"     ollama pull {model}","info")
+
+    def _create_launchers(self):
+        script_path = Path(__file__).resolve()
+
+        # Script .sh
+        sh = (f"#!/bin/bash\n# Lanzador MireIA\n"
+              f"source {VENV_DIR}/bin/activate\n"
+              f"python3 {script_path} \"$@\"\n")
+        LAUNCHER_SH.parent.mkdir(parents=True, exist_ok=True)
+        LAUNCHER_SH.write_text(sh)
+        os.chmod(LAUNCHER_SH, 0o755)
+        self.log(f"  ✓  {LAUNCHER_SH}","ok")
+
+        # .desktop
+        icon = "audio-input-microphone"  # icono de sistema
+        dt = (f"[Desktop Entry]\n"
+              f"Name=MireIA\n"
+              f"Comment=Asistente de voz local\n"
+              f"Exec=bash {LAUNCHER_SH}\n"
+              f"Icon={icon}\n"
+              f"Terminal=false\n"
+              f"Type=Application\n"
+              f"Categories=Utility;AudioVideo;\n")
+        LAUNCHER_DT.parent.mkdir(parents=True, exist_ok=True)
+        LAUNCHER_DT.write_text(dt)
+        self.log(f"  ✓  {LAUNCHER_DT}","ok")
+
+        # Lanzador de modo asistente (terminal)
+        run_sh_path = Path("~/Desktop/MireIA-run.sh").expanduser()
+        run_sh = (f"#!/bin/bash\n# Arranca el asistente en terminal\n"
+                  f"source {VENV_DIR}/bin/activate\n"
+                  f"python3 {script_path} --run\n")
+        run_sh_path.write_text(run_sh)
+        os.chmod(run_sh_path, 0o755)
+        self.log(f"  ✓  {run_sh_path}  (modo consola)","ok")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  CONFIGURACIÓN
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _save_config(self):
+        modelo = self._cfg["modelo"].get().strip()
+        if not modelo:
+            messagebox.showwarning("Campo vacío","Especifica un modelo de Ollama.")
+            return
+        cfg = {
+            "modelo":         modelo,
+            "whisper":        self._cfg["whisper"].get().strip(),
+            "wake_variantes": self._cfg["wake_variantes"].get().strip(),
+            "sistema":        self._sys_text.get("1.0","end").strip(),
+            "piper_bin":      self._cfg["piper_bin"].get().strip(),
+            "voice_model":    self._cfg["voice_model"].get().strip(),
+            "temperatura":    self._cfg["temperatura"].get().strip(),
+            "num_predict":    self._cfg["num_predict"].get().strip(),
+        }
+        save_config(cfg)
+        self.log(f"  ✓  Config guardada → {CONFIG_PATH}","ok")
+        self._footer(f"Guardado: {CONFIG_PATH}")
+        self._update_status_row("config","ok",str(CONFIG_PATH))
+        self._update_run_cfg_label()
+        messagebox.showinfo("Guardado", f"Configuración guardada en:\n{CONFIG_PATH}")
+
+    def _reload_config(self):
+        cfg = load_config()
+        if not cfg: return
+        for k in ("modelo","whisper","wake_variantes","piper_bin","voice_model",
+                  "temperatura","num_predict"):
+            if k in self._cfg and k in cfg:
+                self._cfg[k].set(cfg[k])
+        self._sys_text.delete("1.0","end")
+        self._sys_text.insert("1.0", cfg.get("sistema",""))
+        self._update_run_cfg_label()
+
+    # ── Wizard primera vez ────────────────────────────────────────────────────
+
+    def _open_config_wizard(self):
+        if self._wizard_open:
+            return
+        self._wizard_open = True
+        win = tk.Toplevel(self)
+        win.title("MireIA — Configuración inicial")
+        win.geometry("500x380")
+        win.configure(bg=C["bg"])
+        win.grab_set()
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", lambda: (setattr(self, "_wizard_open", False), win.destroy()))
+
+        tk.Label(win, text="Primera configuración",
+                 font=tkfont.Font(family="Courier 10 Pitch",size=14,weight="bold"),
+                 bg=C["bg"], fg=C["accent"]).pack(pady=(20,2))
+        tk.Label(win, text="No se encontró ~/.asistente_voz.json  —  crea uno ahora.",
+                 font=self.f_small, bg=C["bg"], fg=C["muted"]).pack(pady=(0,14))
+        tk.Frame(win, bg=C["border"], height=1).pack(fill="x", padx=24, pady=(0,12))
+
+        wv = {}
+        def wf(key, label, default, combo=None):
+            row = tk.Frame(win, bg=C["card"])
+            row.pack(fill="x", padx=24, pady=4)
+            tk.Label(row, text=label, font=self.f_label, bg=C["card"],
+                     fg=C["dim"], width=20, anchor="w").pack(side="left",padx=(10,4),pady=8)
+            var = tk.StringVar(value=default)
+            if combo:
+                w = ttk.Combobox(row, textvariable=var, values=combo,
+                                 font=self.f_label, state="normal", width=22)
+            else:
+                w = tk.Entry(row, textvariable=var, font=self.f_label,
+                             bg=C["bg"], fg=C["text"], relief="flat",
+                             insertbackground=C["accent"], width=28)
+            w.pack(side="left", padx=(0,10), pady=6)
+            wv[key] = var
+
+        wf("modelo",  "Modelo Ollama",       "llama3.2:3b",   combo=_OLLAMA_MODELS)
+        wf("whisper", "Modelo Whisper",      "small",         combo=_WHISPER_MODELS)
+        wf("wake",    "Palabra de activación","mireia, mire")
+
+        def on_save():
+            if not wv["modelo"].get().strip():
+                messagebox.showwarning("Vacío","Elige un modelo.",parent=win); return
+            cfg = {
+                "modelo":         wv["modelo"].get().strip(),
+                "whisper":        wv["whisper"].get().strip(),
+                "wake_variantes": wv["wake"].get().strip(),
+                "sistema": ("Eres Mireia, una asistente de voz en español. "
+                            "Responde de forma concisa y natural, como si estuvieras hablando. "
+                            "Evita listas y formatos; habla en prosa. "
+                            "Sé amable, directa y útil. Máximo 3 frases salvo más detalle."),
+                "piper_bin":   str(PIPER_BIN),
+                "voice_model": str(voice_model_path()),
+                "temperatura": "0.4",
+                "num_predict": "800",
+            }
+            save_config(cfg)
+            self.log(f"  ✓  Configuración creada en {CONFIG_PATH}","ok")
+            self._update_status_row("config","ok",str(CONFIG_PATH))
+            self._update_badge("● configurado", C["success"])
+            self._wizard_open = False
+            win.destroy()
+            self._reload_config()
+            self.nb.select(1)
+
+        brow = tk.Frame(win, bg=C["bg"])
+        brow.pack(pady=18)
+        self._btn(brow, "CREAR CONFIGURACIÓN", on_save, C["accent"], fg="#000"
+                  ).pack(side="left", padx=8)
+        tk.Button(brow, text="Cancelar",
+                  command=lambda: (setattr(self, "_wizard_open", False), win.destroy()),
+                  bg=C["surface"], fg=C["muted"], font=self.f_btn,
+                  relief="flat", bd=0, padx=12, pady=6).pack(side="left")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  EJECUTAR (pestaña Run)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _update_run_cfg_label(self):
+        cfg = load_config()
+        if cfg:
+            texto = (f"Modelo: {cfg.get('modelo','?')}  ·  "
+                     f"Whisper: {cfg.get('whisper','?')}  ·  "
+                     f"Wake: {cfg.get('wake_variantes','?')}")
+        else:
+            texto = "Sin configuración — ve a CONFIGURAR primero"
+        self.after(0, lambda: self._run_cfg_lbl.configure(text=texto))
+
+    def _start_assistant_process(self):
+        if not CONFIG_PATH.exists():
+            messagebox.showwarning("Sin configuración",
+                "Crea primero una configuración en la pestaña CONFIGURAR.")
+            self.nb.select(1); return
+
+        if not VENV_PY.exists():
+            messagebox.showwarning("Sin entorno virtual",
+                "Instala el entorno primero desde la pestaña INSTALAR.")
+            self.nb.select(0); return
+
+        self._run_log_append("── Iniciando MireIA …", "sys")
+        self._set_run_state(True)
+
+        script = str(Path(__file__).resolve())
+        cmd    = [str(VENV_PY), script, "--run"]
+        try:
+            self._assistant_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+            threading.Thread(target=self._read_proc_output, daemon=True).start()
+        except Exception as e:
+            self._run_log_append(f"✗ Error: {e}", "sys")
+            self._set_run_state(False)
+
+    def _read_proc_output(self):
+        proc = self._assistant_proc
+        if not proc: return
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line: continue
+            if "Tú:" in line:
+                self._run_log_append(line, "usr")
+            elif "IA:" in line:
+                self._run_log_append(line, "ia")
+            else:
+                self._run_log_append(line, "sys")
+        proc.wait()
+        self.after(0, lambda: self._set_run_state(False))
+        self.after(0, lambda: self._run_log_append("── Proceso terminado.", "sys"))
+
+    def _stop_assistant(self):
+        if self._assistant_proc:
+            self._assistant_proc.terminate()
+            self._assistant_proc = None
+        self._set_run_state(False)
+
+    def _set_run_state(self, running):
+        if running:
+            self._run_active = True
+            self._run_status_lbl.configure(text="Asistente activo", fg=C["success"])
+            self._run_anim_lbl.configure(fg=C["success"])
+            self._btn_start.configure(state="disabled")
+            self._btn_stop.configure(state="normal")
+            self._animate_run()
+        else:
+            self._run_active = False
+            self._run_status_lbl.configure(text="Asistente en reposo", fg=C["muted"])
+            self._run_anim_lbl.configure(text="◌", fg=C["muted"])
+            self._btn_start.configure(state="normal")
+            self._btn_stop.configure(state="disabled")
+
+    def _animate_run(self):
+        if not self._run_active: return
+        c = self._run_anim_chars
+        self._run_anim_idx = (self._run_anim_idx + 1) % len(c)
+        self._run_anim_lbl.configure(text=c[self._run_anim_idx])
+        self.after(220, self._animate_run)
+
+    def _run_log_append(self, msg, tag="sys"):
+        def _do():
+            self._run_log.configure(state="normal")
+            self._run_log.insert("end", msg+"\n", tag)
+            self._run_log.see("end")
+            self._run_log.configure(state="disabled")
+        self.after(0, _do)
+
+    # ── Estado ─────────────────────────────────────────────────────────────────
+
+    def _run_status_check(self):
+        """Check silencioso para la pestaña Estado (no escribe en el log)."""
+        if self._check_running:
+            return
+        threading.Thread(target=self._silent_status_thread, daemon=True).start()
+
+    def _silent_status_thread(self):
+        """Actualiza solo los iconos de la pestaña Estado sin tocar el log."""
+        v = sys.version_info
+        self._update_status_row("python",
+            "ok" if v >= (3,8) else "err", f"{v.major}.{v.minor}.{v.micro}")
+        self._update_status_row("venv",
+            "ok" if VENV_PY.exists() else "warn",
+            "" if VENV_PY.exists() else "no creado")
+        for pkg, key, imp in [
+            ("whisper","whisper","whisper"),
+            ("SpeechRecognition","sr","speech_recognition"),
+            ("pyaudio","pyaudio","pyaudio"),
+            ("ollama","ollama_lib","ollama"),
+        ]:
+            ok = venv_has(imp)
+            self._update_status_row(key, "ok" if ok else "warn",
+                                    "" if ok else "no instalado")
+        self._update_status_row("piper_bin",
+            "ok" if PIPER_BIN.exists() else "warn",
+            str(PIPER_BIN) if PIPER_BIN.exists() else "no instalado")
+        vm = voice_model_path()
+        self._update_status_row("voice_mdl",
+            "ok" if vm.exists() else "warn",
+            vm.name if vm.exists() else "no descargado")
+        if shutil.which("ollama"):
+            rc, _ = run_cmd(["ollama","list"], timeout=4)
+            self._update_status_row("ollama_srv",
+                "ok" if rc == 0 else "warn",
+                "" if rc == 0 else "servicio offline")
+        else:
+            self._update_status_row("ollama_srv", "warn", "no instalado")
+        self._update_status_row("config",
+            "ok" if CONFIG_PATH.exists() else "warn",
+            str(CONFIG_PATH) if CONFIG_PATH.exists() else "no creado")
+        for tool, key in [("espeak-ng","espeak"),("aplay","aplay"),("ffmpeg","ffmpeg")]:
+            self._update_status_row(key,
+                "ok" if shutil.which(tool) else "warn",
+                "" if shutil.which(tool) else "no instalado")
+        self._update_status_row("audio_grp",
+            "ok" if in_audio_group() else "warn",
+            "OK" if in_audio_group() else "sudo usermod -aG audio $USER")
+        free = disk_free_mb()
+        self._update_status_row("disk",
+            "ok" if free >= 2000 else "warn", f"{free} MB libres")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def check_tk():
+    try:
+        r = tk.Tk(); r.destroy(); return True
+    except Exception:
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=f"{APP_NAME} {VERSION} — Asistente de voz local")
+    parser.add_argument("--run",   action="store_true",
+                        help="Arrancar el asistente de voz directamente (sin GUI)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Modo debug (muestra errores de audio)")
+    args = parser.parse_args()
+
+    if platform.system() != "Linux":
+        print(f"⚠  {APP_NAME} está diseñado para Linux.")
+        sys.exit(1)
+
+    if args.run or args.debug:
+        run_assistant(debug=args.debug)
+        return
+
+    if not check_tk():
+        print("✗  tkinter no disponible.")
+        print("   Instala: sudo apt install python3-tk")
+        sys.exit(1)
+
+    app = MireIAApp()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
